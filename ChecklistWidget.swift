@@ -1,10 +1,13 @@
 // Desktop checklist widget for an Obsidian Worklist folder.
-// The folder is set by the "location:" line in worklist-location.txt next to this file.
-// Shows the newest YYYY-MM-DD note there (named after the day it's for; tomorrow's is
-// created at 8pm so it can be planned the night before) at the middle-right of the
-// desktop, grouped by the note's "## " sections, and edits its "- [ ]" lines in place.
-// Notes are created from the vault's Daily template, and the current note is
-// re-shaped whenever that template changes (keeping its tasks).
+// Runs in one of two modes, each as its own LaunchAgent:
+// - daily (default): folder from worklist-location.txt; notes named after the day they're
+//   for, with tomorrow's created at 8pm so it can be planned the night before.
+// - weekly (--weekly): folder from weekly-location.txt; notes named after the week's Monday,
+//   with a new one from Monday 00:00 (weeks run Monday to Sunday).
+// Shows the newest YYYY-MM-DD note at the middle-right of the desktop, grouped by the
+// note's "## " sections, and edits its "- [ ]" lines in place. Notes are created from the
+// vault's Daily/Weekly template, and the current note is re-shaped whenever that template
+// changes (keeping its tasks).
 
 import AppKit
 import SwiftUI
@@ -12,8 +15,22 @@ import Observation
 
 // MARK: - Config
 
+/// Which checklist this process shows; set by the LaunchAgent's arguments.
+enum Mode {
+    case daily, weekly
+
+    static let current: Mode = CommandLine.arguments.contains("--weekly") ? .weekly : .daily
+
+    var locationFileName: String { self == .daily ? "worklist-location.txt" : "weekly-location.txt" }
+    var templateName: String { self == .daily ? "Daily template.md" : "Weekly template.md" }
+    var templateKeyword: String { self == .daily ? "daily" : "weekly" }
+    /// Both modes share one defaults domain (same binary), so weekly keys get a prefix.
+    var defaultsPrefix: String { self == .daily ? "" : "weekly." }
+    /// Position counted from the right edge of the screen.
+    var slot: Int { self == .daily ? 0 : 1 }
+}
+
 enum Config {
-    static let templateName = "Daily template.md"
     static let fallbackTemplate = """
         ---
         tags:
@@ -31,6 +48,7 @@ enum Config {
         """
     static let width: CGFloat = 300
     static let margin: CGFloat = 24
+    static let gap: CGFloat = 16
     static let cornerRadius: CGFloat = 18
     static let pollInterval: TimeInterval = 1.5
     static let rolloverHour = 20  // 8pm: tomorrow's note gets created
@@ -54,8 +72,8 @@ struct WorklistLocation {
         var errorDescription: String? {
             switch self {
             case .unreadable(let path, let reason): return "Can't read \(path)\n\(reason)"
-            case .noLocationLine: return "Add a line like \"location: /path/to/Worklist\" to worklist-location.txt"
-            case .folderMissing(let path): return "Worklist folder not found:\n\(path)\nUpdate worklist-location.txt"
+            case .noLocationLine: return "Add a line like \"location: /path/to/folder\" to \(Mode.current.locationFileName)"
+            case .folderMissing(let path): return "Folder not found:\n\(path)\nUpdate \(Mode.current.locationFileName)"
             }
         }
     }
@@ -102,8 +120,9 @@ struct WorklistLocation {
         return nil
     }
 
-    /// The daily template in the vault's Templates folder: "Daily template.md" if present,
-    /// otherwise any note there with "daily" in its name (so renaming it doesn't break things).
+    /// The template in the vault's Templates folder: "Daily template.md" (or "Weekly template.md")
+    /// if present, otherwise any note there with "daily" (or "weekly") in its name, so renaming
+    /// it doesn't break things.
     var template: URL? {
         guard let vault,
               let data = try? Data(contentsOf: vault.appendingPathComponent(".obsidian/templates.json")),
@@ -113,8 +132,8 @@ struct WorklistLocation {
         let folder = vault.appendingPathComponent(folderName)
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return nil }
         let notes = names.filter { $0.lowercased().hasSuffix(".md") }.sorted()
-        let name = notes.first { $0.lowercased() == Config.templateName.lowercased() }
-            ?? notes.first { $0.lowercased().contains("daily") }
+        let name = notes.first { $0.lowercased() == Mode.current.templateName.lowercased() }
+            ?? notes.first { $0.lowercased().contains(Mode.current.templateKeyword) }
         return name.map { folder.appendingPathComponent($0) }
     }
 }
@@ -125,13 +144,13 @@ struct WorklistLocation {
 /// - if the file can't be read at all, the last folder that worked keeps being used.
 @MainActor
 final class LocationResolver {
-    private var locationFile = URL(fileURLWithPath: locationFilePath)
+    private var locationFile = URL(fileURLWithPath: projectDirectory).appendingPathComponent(Mode.current.locationFileName)
     private var lastGood: WorklistLocation?
     private var lastWarning: String?
     private let defaults = UserDefaults.standard
-    private let fileBookmarkKey = "locationFileBookmark"
-    private let folderBookmarkKey = "worklistFolderBookmark"
-    private let folderPathKey = "worklistFolderPath"
+    private let fileBookmarkKey = Mode.current.defaultsPrefix + "locationFileBookmark"
+    private let folderBookmarkKey = Mode.current.defaultsPrefix + "worklistFolderBookmark"
+    private let folderPathKey = Mode.current.defaultsPrefix + "worklistFolderPath"
 
     func resolve() throws -> WorklistLocation {
         let fm = FileManager.default
@@ -387,7 +406,7 @@ final class NoteStore {
     @ObservationIgnored private let resolver = LocationResolver()
     @ObservationIgnored private var templateWarning: String?
     /// Template text last applied to each recent note, so a note is only re-shaped when the template changes.
-    @ObservationIgnored private let appliedTemplatesKey = "appliedTemplates"
+    @ObservationIgnored private let appliedTemplatesKey = Mode.current.defaultsPrefix + "appliedTemplates"
 
     private static let dayFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -399,18 +418,37 @@ final class NoteStore {
     /// Start of the current day; observed so the Today/Tomorrow label redraws at midnight.
     private(set) var today = Calendar.current.startOfDay(for: Date())
 
-    /// Notes are named after the day they're for.
+    /// Notes are named after the day they're for (weekly: the week's Monday).
     var planDate: Date? {
         noteURL.flatMap { Self.dayFormatter.date(from: $0.deletingPathExtension().lastPathComponent) }
     }
 
-    /// The note that should exist by now: tomorrow's from the rollover hour on, otherwise today's.
+    /// Monday 00:00 of the week containing the date.
+    static func weekStart(_ date: Date) -> Date {
+        var calendar = Calendar.current
+        calendar.firstWeekday = 2
+        return calendar.dateInterval(of: .weekOfYear, for: date)!.start
+    }
+
+    /// The note that should exist by now. Daily: tomorrow's from the rollover hour on,
+    /// otherwise today's. Weekly: this week's.
     static func currentNoteName(now: Date = Date()) -> String {
         let calendar = Calendar.current
-        let day = calendar.component(.hour, from: now) >= Config.rolloverHour
-            ? calendar.date(byAdding: .day, value: 1, to: now)!
-            : now
+        let day: Date
+        switch Mode.current {
+        case .daily:
+            day = calendar.component(.hour, from: now) >= Config.rolloverHour
+                ? calendar.date(byAdding: .day, value: 1, to: now)!
+                : now
+        case .weekly:
+            day = weekStart(now)
+        }
         return dayFormatter.string(from: day) + ".md"
+    }
+
+    /// Notes named this or later are still current, so they follow template changes.
+    static func oldestCurrentName(now: Date = Date()) -> String {
+        dayFormatter.string(from: Mode.current == .weekly ? weekStart(now) : now) + ".md"
     }
 
     // MARK: Loading
@@ -476,7 +514,7 @@ final class NoteStore {
     /// Re-shapes today's or a future note to the template when the template has changed since.
     private func syncWithTemplate(_ template: String, note url: URL) throws {
         let name = url.lastPathComponent
-        guard name >= Self.dayFormatter.string(from: today) + ".md" else { return }
+        guard name >= Self.oldestCurrentName() else { return }
         var applied = UserDefaults.standard.dictionary(forKey: appliedTemplatesKey) as? [String: String] ?? [:]
         guard applied[name] != template else { return }
         let original = try String(contentsOf: url, encoding: .utf8)
@@ -675,18 +713,35 @@ struct ChecklistView: View {
 
     private var title: String {
         guard let date = store.planDate else { return "No note" }
-        return date.formatted(.dateTime.weekday(.wide).day().month(.wide))
+        switch Mode.current {
+        case .daily:
+            return date.formatted(.dateTime.weekday(.wide).day().month(.wide))
+        case .weekly:
+            let sunday = Calendar.current.date(byAdding: .day, value: 6, to: date)!
+            let format = Date.FormatStyle.dateTime.day().month(.abbreviated)
+            return "\(date.formatted(format)) – \(sunday.formatted(format))"
+        }
     }
 
     private var subtitle: String {
         var parts: [String] = []
         if let date = store.planDate {
             // Compare against store.today (not the clock) so this redraws when the day changes.
-            switch Calendar.current.dateComponents([.day], from: store.today, to: date).day {
-            case 0: parts.append("Today")
-            case 1: parts.append("Tomorrow")
-            case -1: parts.append("Yesterday")
-            default: break
+            switch Mode.current {
+            case .daily:
+                switch Calendar.current.dateComponents([.day], from: store.today, to: date).day {
+                case 0: parts.append("Today")
+                case 1: parts.append("Tomorrow")
+                case -1: parts.append("Yesterday")
+                default: break
+                }
+            case .weekly:
+                switch Calendar.current.dateComponents([.day], from: NoteStore.weekStart(store.today), to: date).day {
+                case 0: parts.append("This week")
+                case 7: parts.append("Next week")
+                case -7: parts.append("Last week")
+                default: break
+                }
             }
         }
         parts.append(filled.isEmpty ? "Nothing planned yet" : "\(doneCount) of \(filled.count) done")
@@ -839,13 +894,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         log("started")
     }
 
-    /// Middle of the right edge of the primary screen.
+    /// Middle of the right edge of the primary screen; the weekly widget sits just left of the daily one.
     private func place() {
         guard let screen = NSScreen.screens.first else { return }
         let visible = screen.visibleFrame
         let height = min(contentHeight, visible.height - 2 * Config.margin)
         let frame = NSRect(
-            x: visible.maxX - Config.width - Config.margin,
+            x: visible.maxX - Config.margin - Config.width - CGFloat(Mode.current.slot) * (Config.width + Config.gap),
             y: visible.midY - height / 2,
             width: Config.width, height: height)
         if frame != panel.frame {
