@@ -1,638 +1,7 @@
-// Desktop checklist widget for an Obsidian Worklist folder.
-// Runs in one of two modes, each as its own LaunchAgent:
-// - daily (default): folder from worklist-location.txt; notes named after the day they're
-//   for, with tomorrow's created at 8pm so it can be planned the night before.
-// - weekly (--weekly): folder from weekly-location.txt; notes named after the week's Monday,
-//   with a new one from Monday 00:00 (weeks run Monday to Sunday).
-// Shows the newest YYYY-MM-DD note at the middle-right of the desktop, grouped by the
-// note's "## " sections, and edits its "- [ ]" lines in place. Notes are created from the
-// vault's Daily/Weekly template, and the current note is re-shaped whenever that template
-// changes (keeping its tasks).
+// The checklist widget's window and views. The logic is in Core.swift; see README.md.
 
 import AppKit
 import SwiftUI
-import Observation
-
-// MARK: - Config
-
-/// Which checklist this process shows; set by the LaunchAgent's arguments.
-enum Mode {
-    case daily, weekly
-
-    static let current: Mode = CommandLine.arguments.contains("--weekly") ? .weekly : .daily
-
-    var locationFileName: String { self == .daily ? "worklist-location.txt" : "weekly-location.txt" }
-    var templateName: String { self == .daily ? "Daily template.md" : "Weekly template.md" }
-    var templateKeyword: String { self == .daily ? "daily" : "weekly" }
-    /// Both modes share one defaults domain (same binary), so weekly keys get a prefix.
-    var defaultsPrefix: String { self == .daily ? "" : "weekly." }
-    /// Position counted from the right edge of the screen.
-    var slot: Int { self == .daily ? 0 : 1 }
-}
-
-enum Config {
-    static let fallbackTemplate = """
-        ---
-        tags:
-        aliases: []
-        type:
-        status:
-        date_created:
-        url:
-        links:
-        ---
-
-
-
-        - [ ] \n    \n- [ ] \n    \n- [ ] \n
-        """
-    static let width: CGFloat = 300
-    static let margin: CGFloat = 24
-    static let gap: CGFloat = 16
-    static let cornerRadius: CGFloat = 18
-    static let pollInterval: TimeInterval = 1.5
-    static let rolloverHour = 20  // 8pm: tomorrow's note gets created
-}
-
-/// A Worklist folder and the Obsidian vault it sits in.
-struct WorklistLocation {
-    let folder: URL
-    let vault: URL?
-
-    init(folder: URL) {
-        self.folder = folder
-        vault = Self.findVault(containing: folder)
-    }
-
-    enum Problem: LocalizedError {
-        case unreadable(path: String, reason: String)
-        case noLocationLine
-        case folderMissing(String)
-
-        var errorDescription: String? {
-            switch self {
-            case .unreadable(let path, let reason): return "Can't read \(path)\n\(reason)"
-            case .noLocationLine: return "Add a line like \"location: /path/to/folder\" to \(Mode.current.locationFileName)"
-            case .folderMissing(let path): return "Folder not found:\n\(path)\nUpdate \(Mode.current.locationFileName)"
-            }
-        }
-    }
-
-    private static let prefix = "location:"
-
-    /// The folder named on the "location:" line of the file (it may not exist).
-    static func configuredFolder(in file: URL) throws -> URL {
-        let text: String
-        do { text = try String(contentsOf: file, encoding: .utf8) }
-        catch {
-            let reason = ((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError)?.localizedDescription
-            throw Problem.unreadable(path: file.path, reason: reason ?? error.localizedDescription)
-        }
-        guard let line = text.components(separatedBy: .newlines)
-            .map({ $0.trimmingCharacters(in: .whitespaces) })
-            .first(where: { $0.lowercased().hasPrefix(prefix) })
-        else { throw Problem.noLocationLine }
-        var path = line.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
-        if path.count >= 2, path.hasPrefix("\""), path.hasSuffix("\"") { path = String(path.dropFirst().dropLast()) }
-        guard !path.isEmpty else { throw Problem.noLocationLine }
-        return URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
-    }
-
-    /// Rewrites the "location:" line, keeping any other lines in the file.
-    static func setConfiguredFolder(_ folder: URL, in file: URL) throws {
-        let newLine = "\(prefix) \(folder.path)"
-        var lines = (try? String(contentsOf: file, encoding: .utf8))?.components(separatedBy: "\n") ?? []
-        if let i = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix(prefix) }) {
-            lines[i] = newLine
-        } else {
-            lines.insert(newLine, at: 0)
-        }
-        try lines.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
-    }
-
-    /// Nearest enclosing folder with a .obsidian directory.
-    private static func findVault(containing folder: URL) -> URL? {
-        var dir = folder
-        while dir.path != "/" {
-            if FileManager.default.fileExists(atPath: dir.appendingPathComponent(".obsidian").path) { return dir }
-            dir.deleteLastPathComponent()
-        }
-        return nil
-    }
-
-    /// The template in the vault's Templates folder: "Daily template.md" (or "Weekly template.md")
-    /// if present, otherwise any note there with "daily" (or "weekly") in its name, so renaming
-    /// it doesn't break things.
-    var template: URL? {
-        guard let vault,
-              let data = try? Data(contentsOf: vault.appendingPathComponent(".obsidian/templates.json")),
-              let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let folderName = settings["folder"] as? String
-        else { return nil }
-        let folder = vault.appendingPathComponent(folderName)
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return nil }
-        let notes = names.filter { $0.lowercased().hasSuffix(".md") }.sorted()
-        let name = notes.first { $0.lowercased() == Mode.current.templateName.lowercased() }
-            ?? notes.first { $0.lowercased().contains(Mode.current.templateKeyword) }
-        return name.map { folder.appendingPathComponent($0) }
-    }
-}
-
-/// Works out the Worklist folder on each refresh, and recovers when things move:
-/// - the location file is followed by bookmark if its folder (e.g. Developer) is moved,
-/// - the Worklist folder is followed by bookmark if it's moved, and the file is corrected,
-/// - if the file can't be read at all, the last folder that worked keeps being used.
-@MainActor
-final class LocationResolver {
-    private var locationFile = URL(fileURLWithPath: projectDirectory).appendingPathComponent(Mode.current.locationFileName)
-    private var lastGood: WorklistLocation?
-    private var lastWarning: String?
-    private let defaults = UserDefaults.standard
-    private let fileBookmarkKey = Mode.current.defaultsPrefix + "locationFileBookmark"
-    private let folderBookmarkKey = Mode.current.defaultsPrefix + "worklistFolderBookmark"
-    private let folderPathKey = Mode.current.defaultsPrefix + "worklistFolderPath"
-
-    func resolve() throws -> WorklistLocation {
-        let fm = FileManager.default
-        if !fm.isReadableFile(atPath: locationFile.path),
-           let moved = Self.follow(defaults.data(forKey: fileBookmarkKey)), moved != locationFile {
-            warn("location file moved to \(moved.path)")
-            locationFile = moved
-        }
-
-        let configured: URL
-        do {
-            configured = try WorklistLocation.configuredFolder(in: locationFile)
-        } catch {
-            // Keep going with the last folder that worked rather than blanking the widget.
-            if let fallback = lastGood?.folder ?? Self.follow(defaults.data(forKey: folderBookmarkKey)),
-               Self.isDirectory(fallback) {
-                warn("\(error.localizedDescription) - using last known folder \(fallback.path)")
-                return remember(fallback, healthy: false)
-            }
-            throw error
-        }
-
-        if Self.isDirectory(configured) { return remember(configured) }
-
-        // Only follow a moved folder when the file still names where it used to be,
-        // so a deliberate edit to the file is never overwritten.
-        if configured.path == defaults.string(forKey: folderPathKey),
-           let moved = Self.follow(defaults.data(forKey: folderBookmarkKey)), Self.isDirectory(moved) {
-            warn("Worklist moved to \(moved.path) - updating \(locationFile.lastPathComponent)")
-            try? WorklistLocation.setConfiguredFolder(moved, in: locationFile)
-            return remember(moved)
-        }
-        throw WorklistLocation.Problem.folderMissing(configured.path)
-    }
-
-    private func remember(_ folder: URL, healthy: Bool = true) -> WorklistLocation {
-        if lastGood?.folder != folder {
-            lastGood = WorklistLocation(folder: folder)
-            if let data = try? folder.bookmarkData() { defaults.set(data, forKey: folderBookmarkKey) }
-            defaults.set(folder.path, forKey: folderPathKey)
-        }
-        if healthy {
-            if let data = try? locationFile.bookmarkData() { defaults.set(data, forKey: fileBookmarkKey) }
-            if lastWarning != nil { log("location file readable again"); lastWarning = nil }
-        }
-        return lastGood!
-    }
-
-    /// Logs each distinct problem once, until things are healthy again.
-    private func warn(_ message: String) {
-        if message != lastWarning { log(message); lastWarning = message }
-    }
-
-    private static func follow(_ bookmark: Data?) -> URL? {
-        guard let bookmark else { return nil }
-        var stale = false
-        guard let url = try? URL(resolvingBookmarkData: bookmark, options: [.withoutUI, .withoutMounting],
-                                 relativeTo: nil, bookmarkDataIsStale: &stale),
-              !url.path.contains("/.Trash/")
-        else { return nil }
-        return url.standardizedFileURL
-    }
-
-    private static func isDirectory(_ url: URL) -> Bool {
-        var isDirectory: ObjCBool = false
-        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
-    }
-}
-
-func log(_ message: String) {
-    print("[\(Date())] \(message)")
-    fflush(stdout)
-}
-
-// MARK: - Markdown
-
-struct TaskItem: Identifiable, Equatable {
-    let id: Int          // ordinal among the note's tasks
-    let lineIndex: Int
-    let done: Bool
-    let text: String
-    var isBlank: Bool { text.isEmpty }
-}
-
-struct Section: Identifiable, Equatable {
-    let id: Int          // ordinal; 0 is whatever comes before the first heading
-    let title: String?
-    let headingLine: Int?
-    var tasks: [TaskItem]
-}
-
-enum Markdown {
-    // prefix "- [", mark, "] ", text
-    static let taskRegex = try! NSRegularExpression(pattern: #"^(\s*[-*+] \[)([ xX])(\] ?)(.*)$"#)
-    static let headingRegex = try! NSRegularExpression(pattern: #"^#{1,6}\s+(.*?)\s*$"#)
-
-    struct Task { let done: Bool; let text: String }
-
-    static func task(in line: String) -> Task? {
-        let ns = line as NSString
-        guard let m = taskRegex.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { return nil }
-        return Task(done: ns.substring(with: m.range(at: 2)) != " ",
-                    text: ns.substring(with: m.range(at: 4)).trimmingCharacters(in: .whitespaces))
-    }
-
-    /// Heading text without the #s or a trailing colon.
-    static func heading(in line: String) -> String? {
-        let ns = line as NSString
-        guard let m = headingRegex.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { return nil }
-        var title = ns.substring(with: m.range(at: 1))
-        while title.hasSuffix(":") { title.removeLast() }
-        return title.trimmingCharacters(in: .whitespaces)
-    }
-
-    /// Index of the first line after the YAML frontmatter (0 if there is none).
-    static func bodyStart(_ lines: [String]) -> Int {
-        guard lines.first == "---", let end = lines.dropFirst().firstIndex(of: "---") else { return 0 }
-        return end + 1
-    }
-
-    static func sections(_ lines: [String]) -> [Section] {
-        var sections = [Section(id: 0, title: nil, headingLine: nil, tasks: [])]
-        var taskCount = 0
-        for index in bodyStart(lines)..<lines.count {
-            let line = lines[index]
-            if let title = heading(in: line) {
-                sections.append(Section(id: sections.count, title: title, headingLine: index, tasks: []))
-            } else if let task = task(in: line) {
-                sections[sections.count - 1].tasks.append(
-                    TaskItem(id: taskCount, lineIndex: index, done: task.done, text: task.text))
-                taskCount += 1
-            }
-        }
-        return sections
-    }
-
-    /// Rewrites only the checkbox mark and/or text of a task line, keeping its indent and bullet.
-    static func rewrite(_ line: String, done: Bool? = nil, text: String? = nil) -> String {
-        let ns = line as NSString
-        guard let m = taskRegex.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { return line }
-        let prefix = ns.substring(with: m.range(at: 1))
-        let mark = done.map { $0 ? "x" : " " } ?? ns.substring(with: m.range(at: 2))
-        let close = text == nil ? ns.substring(with: m.range(at: 3)) : "] "
-        let body = text ?? ns.substring(with: m.range(at: 4))
-        return prefix + mark + close + body
-    }
-
-    // MARK: Template merge
-
-    private struct Chunk {
-        let key: String          // normalised heading, "" before the first heading
-        let headingLine: String?
-        var lines: [String]
-    }
-
-    private static func key(_ title: String?) -> String { (title ?? "").lowercased() }
-
-    private static func chunks(_ lines: [String]) -> [Chunk] {
-        var chunks = [Chunk(key: "", headingLine: nil, lines: [])]
-        for line in lines.dropFirst(bodyStart(lines)) {
-            if let title = heading(in: line) {
-                chunks.append(Chunk(key: key(title), headingLine: line, lines: []))
-            } else {
-                chunks[chunks.count - 1].lines.append(line)
-            }
-        }
-        return chunks
-    }
-
-    /// Lays the note out like the template: the template's sections in its order and format,
-    /// with the note's tasks kept in their matching sections (ticks preserved, filling the
-    /// template's empty slots first). Sections the template doesn't have are kept at the end,
-    /// and the note's own frontmatter is kept. No task is ever dropped.
-    static func merge(template: String, into note: String) -> String {
-        let templateLines = template.components(separatedBy: "\n")
-        let noteLines = note.components(separatedBy: "\n")
-        let templateChunks = chunks(templateLines)
-        let noteChunks = chunks(noteLines)
-
-        // The note's filled tasks, grouped by section.
-        var pools: [String: [Task]] = [:]
-        for chunk in noteChunks {
-            pools[chunk.key, default: []] += chunk.lines.compactMap(task(in:)).filter { !$0.text.isEmpty }
-        }
-        // Tasks from before any heading go into the template's first section that has tasks.
-        let hasTaskLines: (Chunk) -> Bool = { $0.lines.contains { task(in: $0) != nil } }
-        if !(templateChunks.first.map(hasTaskLines) ?? false),
-           let target = templateChunks.first(where: hasTaskLines)?.key,
-           let loose = pools.removeValue(forKey: "") {
-            pools[target] = loose + (pools[target] ?? [])
-        }
-
-        var body: [String] = []
-        var templateKeys = Set<String>()
-        for chunk in templateChunks {
-            templateKeys.insert(chunk.key)
-            var pool = pools[chunk.key] ?? []
-            let fixed = Set(chunk.lines.compactMap(task(in:)).map { $0.text.lowercased() }.filter { !$0.isEmpty })
-            var out: [String] = []
-            for line in chunk.lines {
-                guard let slot = task(in: line) else { out.append(line); continue }
-                if !slot.text.isEmpty {
-                    // A task the template always has: keep the note's tick for it.
-                    if let i = pool.firstIndex(where: { $0.text.lowercased() == slot.text.lowercased() }) {
-                        out.append(rewrite(line, done: pool.remove(at: i).done))
-                    } else {
-                        out.append(line)
-                    }
-                } else if let i = pool.firstIndex(where: { !fixed.contains($0.text.lowercased()) }) {
-                    let task = pool.remove(at: i)
-                    out.append(rewrite(line, done: task.done, text: task.text))
-                } else {
-                    out.append(line)
-                }
-            }
-            // More tasks than empty slots: add them after the section's last task.
-            let extras = pool.filter { !fixed.contains($0.text.lowercased()) }
-            if !extras.isEmpty {
-                let at = (out.lastIndex { task(in: $0) != nil }).map { $0 + 1 } ?? 0
-                out.insert(contentsOf: extras.map { "- [\($0.done ? "x" : " ")] \($0.text)" }, at: at)
-            }
-            if let heading = chunk.headingLine { body.append(heading) }
-            body += out
-        }
-
-        // Keep anything in sections the template no longer has.
-        for chunk in noteChunks where !templateKeys.contains(chunk.key) {
-            guard chunk.lines.contains(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { continue }
-            if let heading = chunk.headingLine { body.append(heading) }
-            body += chunk.lines
-        }
-
-        let noteStart = bodyStart(noteLines)
-        let frontmatter = noteStart > 0
-            ? Array(noteLines[..<noteStart])
-            : Array(templateLines[..<bodyStart(templateLines)])
-        return (frontmatter + body).joined(separator: "\n")
-    }
-}
-
-// MARK: - Model
-
-@MainActor @Observable
-final class NoteStore {
-    private(set) var noteURL: URL?
-    private(set) var sections: [Section] = []
-    private(set) var errorMessage: String?
-    var tasks: [TaskItem] { sections.flatMap(\.tasks) }
-
-    @ObservationIgnored var isEditing: () -> Bool = { false }
-    @ObservationIgnored private var loadedModified: Date?
-    @ObservationIgnored private var location: WorklistLocation?
-    @ObservationIgnored private let resolver = LocationResolver()
-    @ObservationIgnored private var templateWarning: String?
-    /// Template text last applied to each recent note, so a note is only re-shaped when the template changes.
-    @ObservationIgnored private let appliedTemplatesKey = Mode.current.defaultsPrefix + "appliedTemplates"
-
-    private static let dayFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyy-MM-dd"
-        return f
-    }()
-
-    /// Start of the current day; observed so the Today/Tomorrow label redraws at midnight.
-    private(set) var today = Calendar.current.startOfDay(for: Date())
-
-    /// Notes are named after the day they're for (weekly: the week's Monday).
-    var planDate: Date? {
-        noteURL.flatMap { Self.dayFormatter.date(from: $0.deletingPathExtension().lastPathComponent) }
-    }
-
-    /// Monday 00:00 of the week containing the date.
-    static func weekStart(_ date: Date) -> Date {
-        var calendar = Calendar.current
-        calendar.firstWeekday = 2
-        return calendar.dateInterval(of: .weekOfYear, for: date)!.start
-    }
-
-    /// The note that should exist by now. Daily: tomorrow's from the rollover hour on,
-    /// otherwise today's. Weekly: this week's.
-    static func currentNoteName(now: Date = Date()) -> String {
-        let calendar = Calendar.current
-        let day: Date
-        switch Mode.current {
-        case .daily:
-            day = calendar.component(.hour, from: now) >= Config.rolloverHour
-                ? calendar.date(byAdding: .day, value: 1, to: now)!
-                : now
-        case .weekly:
-            day = weekStart(now)
-        }
-        return dayFormatter.string(from: day) + ".md"
-    }
-
-    /// Notes named this or later are still current, so they follow template changes.
-    static func oldestCurrentName(now: Date = Date()) -> String {
-        dayFormatter.string(from: Mode.current == .weekly ? weekStart(now) : now) + ".md"
-    }
-
-    // MARK: Loading
-
-    func refresh(force: Bool = false) {
-        let startOfToday = Calendar.current.startOfDay(for: Date())
-        if startOfToday != today { today = startOfToday }
-        guard force || !isEditing() else { return }
-        do {
-            let location = try resolver.resolve()
-            self.location = location
-            let template = readTemplate(location)
-            let url = try resolveNote(in: location, template: template)
-            if let template { try syncWithTemplate(template, note: url) }
-            let modified = Self.modificationDate(of: url)
-            if force || url != noteURL || modified != loadedModified {
-                try load(url)
-            }
-            if errorMessage != nil { errorMessage = nil }
-        } catch {
-            if error is WorklistLocation.Problem, noteURL != nil {
-                noteURL = nil
-                sections = []
-                loadedModified = nil
-            }
-            let message = error.localizedDescription
-            if message != errorMessage {
-                errorMessage = message
-                log("refresh failed: \(message)")
-            }
-        }
-    }
-
-    private func readTemplate(_ location: WorklistLocation) -> String? {
-        let text = location.template.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
-        let warning = text == nil ? "no daily template found - using a plain checklist" : nil
-        if warning != templateWarning {
-            log(warning ?? "using template \(location.template?.lastPathComponent ?? "")")
-            templateWarning = warning
-        }
-        return text
-    }
-
-    /// Newest dated note in the folder; creates the current one from the template if nothing is that new.
-    private func resolveNote(in location: WorklistLocation, template: String?) throws -> URL {
-        let fm = FileManager.default
-        let dated = try fm.contentsOfDirectory(atPath: location.folder.path)
-            .filter { $0.range(of: #"^\d{4}-\d{2}-\d{2}\.md$"#, options: .regularExpression) != nil }
-            .sorted()
-        let currentName = Self.currentNoteName()
-        if let newest = dated.last, newest >= currentName {
-            return location.folder.appendingPathComponent(newest)
-        }
-        let url = location.folder.appendingPathComponent(currentName)
-        if !fm.fileExists(atPath: url.path) {
-            try (template ?? Config.fallbackTemplate).write(to: url, atomically: true, encoding: .utf8)
-            if let template { recordApplied(template, to: currentName) }
-            log("created \(currentName)")
-        }
-        return url
-    }
-
-    /// Re-shapes today's or a future note to the template when the template has changed since.
-    private func syncWithTemplate(_ template: String, note url: URL) throws {
-        let name = url.lastPathComponent
-        guard name >= Self.oldestCurrentName() else { return }
-        var applied = UserDefaults.standard.dictionary(forKey: appliedTemplatesKey) as? [String: String] ?? [:]
-        guard applied[name] != template else { return }
-        let original = try String(contentsOf: url, encoding: .utf8)
-        let merged = Markdown.merge(template: template, into: original)
-        if merged != original {
-            try merged.write(to: url, atomically: true, encoding: .utf8)
-            log("updated \(name) to match the template")
-        }
-        applied[name] = template
-        UserDefaults.standard.set(applied, forKey: appliedTemplatesKey)
-    }
-
-    private func recordApplied(_ template: String, to name: String) {
-        var applied = UserDefaults.standard.dictionary(forKey: appliedTemplatesKey) as? [String: String] ?? [:]
-        applied[name] = template
-        // Only recent notes matter.
-        for key in applied.keys.sorted().dropLast(14) { applied.removeValue(forKey: key) }
-        UserDefaults.standard.set(applied, forKey: appliedTemplatesKey)
-    }
-
-    private func load(_ url: URL) throws {
-        let text = try String(contentsOf: url, encoding: .utf8)
-        let parsed = Markdown.sections(text.components(separatedBy: "\n"))
-        if url != noteURL { noteURL = url; log("showing \(url.lastPathComponent)") }
-        if parsed != sections { sections = parsed }
-        loadedModified = Self.modificationDate(of: url)
-    }
-
-    private static func modificationDate(of url: URL) -> Date? {
-        try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
-    }
-
-    private static func sanitize(_ text: String) -> String {
-        text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
-    }
-
-    // MARK: Edits
-
-    /// Re-reads the file, applies the change to its lines, writes it back and reloads.
-    private func mutate(_ change: (inout [String], [Section]) -> Void) {
-        guard let url = noteURL else { return }
-        do {
-            let original = try String(contentsOf: url, encoding: .utf8)
-            var lines = original.components(separatedBy: "\n")
-            change(&lines, Markdown.sections(lines))
-            let updated = lines.joined(separator: "\n")
-            if updated != original {
-                try updated.write(to: url, atomically: true, encoding: .utf8)
-            }
-            try load(url)
-        } catch {
-            errorMessage = error.localizedDescription
-            log("write failed: \(error)")
-        }
-    }
-
-    func toggle(_ id: Int) {
-        mutate { lines, sections in
-            guard let task = sections.flatMap(\.tasks).first(where: { $0.id == id }), !task.isBlank else { return }
-            lines[task.lineIndex] = Markdown.rewrite(lines[task.lineIndex], done: !task.done)
-        }
-    }
-
-    func setText(_ id: Int, _ text: String) {
-        let clean = Self.sanitize(text)
-        mutate { lines, sections in
-            guard let task = sections.flatMap(\.tasks).first(where: { $0.id == id }), task.text != clean else { return }
-            lines[task.lineIndex] = Markdown.rewrite(lines[task.lineIndex], done: clean.isEmpty ? false : nil, text: clean)
-        }
-    }
-
-    func delete(_ id: Int) {
-        mutate { lines, sections in
-            guard let task = sections.flatMap(\.tasks).first(where: { $0.id == id }) else { return }
-            let i = task.lineIndex
-            func isSpacer(_ j: Int) -> Bool { j >= 0 && j < lines.count && lines[j].trimmingCharacters(in: .whitespaces).isEmpty }
-            // Take the template's spacer line with it so gaps don't pile up.
-            if isSpacer(i + 1) && isSpacer(i - 1) { lines.remove(at: i + 1) }
-            lines.remove(at: i)
-        }
-    }
-
-    /// Fills the section's first empty slot after its last filled task, otherwise adds a line
-    /// after its last task (or straight under its heading).
-    func add(_ text: String, to sectionID: Int) {
-        let clean = Self.sanitize(text)
-        guard !clean.isEmpty else { return }
-        mutate { lines, sections in
-            guard let section = sections.first(where: { $0.id == sectionID }) else { return }
-            let lastFilled = section.tasks.last(where: { !$0.isBlank })?.id ?? -1
-            if let blank = section.tasks.first(where: { $0.isBlank && $0.id > lastFilled }) {
-                lines[blank.lineIndex] = Markdown.rewrite(lines[blank.lineIndex], done: false, text: clean)
-            } else if let last = section.tasks.last {
-                let indent = String(lines[last.lineIndex].prefix { $0 == " " || $0 == "\t" })
-                lines.insert(indent + "- [ ] " + clean, at: last.lineIndex + 1)
-            } else if let heading = section.headingLine {
-                lines.insert("- [ ] " + clean, at: heading + 1)
-            } else if lines.last == "" {
-                lines.insert("- [ ] " + clean, at: lines.count - 1)
-            } else {
-                lines.append("- [ ] " + clean)
-            }
-        }
-    }
-
-    func openInObsidian() {
-        guard let url = noteURL, let vault = location?.vault else { return }
-        let fileInVault = url.deletingPathExtension().path.dropFirst(vault.path.count + 1)
-        var components = URLComponents()
-        components.scheme = "obsidian"
-        components.host = "open"
-        components.queryItems = [
-            URLQueryItem(name: "vault", value: vault.lastPathComponent),
-            URLQueryItem(name: "file", value: String(fileInVault)),
-        ]
-        if let link = components.url { NSWorkspace.shared.open(link) }
-    }
-}
 
 // MARK: - Views
 
@@ -640,8 +9,15 @@ struct ChecklistView: View {
     let store: NoteStore
     let onHeightChange: (CGFloat) -> Void
 
+    @State private var listHeight: CGFloat = 0
+
     private var filled: [TaskItem] { store.tasks.filter { !$0.isBlank } }
     private var doneCount: Int { filled.filter(\.done).count }
+
+    /// Tall enough for the screen once the header is counted; beyond that the list scrolls.
+    private var maxListHeight: CGFloat {
+        (NSScreen.screens.first?.visibleFrame.height ?? 800) - 2 * Config.margin - 130
+    }
 
     /// Headed sections always show; the bit before the first heading only if it has tasks.
     private var visibleSections: [Section] {
@@ -657,23 +33,28 @@ struct ChecklistView: View {
             if let error = store.errorMessage {
                 Text(error).font(.caption).foregroundStyle(.red)
             }
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(visibleSections) { section in
-                    VStack(alignment: .leading, spacing: 0) {
-                        if let title = section.title {
-                            Text(title.uppercased())
-                                .font(.system(size: 10, weight: .semibold))
-                                .kerning(0.6)
-                                .foregroundStyle(.secondary)
-                                .padding(.bottom, 2)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(visibleSections) { section in
+                        VStack(alignment: .leading, spacing: 0) {
+                            if let title = section.title {
+                                Text(title.uppercased())
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .kerning(0.6)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.bottom, 2)
+                            }
+                            ForEach(section.tasks.filter { !$0.isBlank }) { task in
+                                TaskRow(task: task, store: store)
+                            }
+                            AddRow(store: store, sectionID: section.id)
                         }
-                        ForEach(section.tasks.filter { !$0.isBlank }) { task in
-                            TaskRow(task: task, store: store)
-                        }
-                        AddRow(store: store, sectionID: section.id)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listHeight = $0 }
             }
+            .frame(height: min(listHeight, maxListHeight))
         }
         .padding(16)
         .frame(width: Config.width, alignment: .leading)
@@ -713,11 +94,11 @@ struct ChecklistView: View {
 
     private var title: String {
         guard let date = store.planDate else { return "No note" }
-        switch Mode.current {
+        switch store.mode {
         case .daily:
             return date.formatted(.dateTime.weekday(.wide).day().month(.wide))
         case .weekly:
-            let sunday = Calendar.current.date(byAdding: .day, value: 6, to: date)!
+            let sunday = NoteDates.calendar.date(byAdding: .day, value: 6, to: date)!
             let format = Date.FormatStyle.dateTime.day().month(.abbreviated)
             return "\(date.formatted(format)) – \(sunday.formatted(format))"
         }
@@ -727,16 +108,16 @@ struct ChecklistView: View {
         var parts: [String] = []
         if let date = store.planDate {
             // Compare against store.today (not the clock) so this redraws when the day changes.
-            switch Mode.current {
+            switch store.mode {
             case .daily:
-                switch Calendar.current.dateComponents([.day], from: store.today, to: date).day {
+                switch NoteDates.calendar.dateComponents([.day], from: store.today, to: date).day {
                 case 0: parts.append("Today")
                 case 1: parts.append("Tomorrow")
                 case -1: parts.append("Yesterday")
                 default: break
                 }
             case .weekly:
-                switch Calendar.current.dateComponents([.day], from: NoteStore.weekStart(store.today), to: date).day {
+                switch NoteDates.calendar.dateComponents([.day], from: NoteDates.weekStart(store.today), to: date).day {
                 case 0: parts.append("This week")
                 case 7: parts.append("Next week")
                 case -7: parts.append("Last week")
@@ -835,7 +216,9 @@ final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let store = NoteStore()
+    private let store = NoteStore(
+        mode: CommandLine.arguments.contains("--weekly") ? .weekly : .daily,
+        projectDirectory: projectDirectory)  // generated into BuildPaths.swift by build.sh
     private var panel: WidgetPanel!
     private var contentHeight: CGFloat = 240
     private var timer: Timer?
@@ -873,6 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         background.addSubview(hosting)
 
         store.isEditing = { [weak self] in self?.panel.firstResponder is NSText }
+        store.endEditing = { [weak self] in _ = self?.panel.makeFirstResponder(nil) }
         store.refresh(force: true)
 
         place()
@@ -900,7 +284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let visible = screen.visibleFrame
         let height = min(contentHeight, visible.height - 2 * Config.margin)
         let frame = NSRect(
-            x: visible.maxX - Config.margin - Config.width - CGFloat(Mode.current.slot) * (Config.width + Config.gap),
+            x: visible.maxX - Config.margin - Config.width - CGFloat(store.mode.slot) * (Config.width + Config.gap),
             y: visible.midY - height / 2,
             width: Config.width, height: height)
         if frame != panel.frame {
@@ -929,6 +313,8 @@ enum ChecklistWidgetApp {
         // processes aren't allowed to download them back by default (reads fail with
         // "Resource deadlock avoided"), so opt in.
         setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, IOPOL_MATERIALIZE_DATALESS_FILES_ON)
+
+        trimLogIfHuge()
 
         let app = NSApplication.shared
         let delegate = AppDelegate()
